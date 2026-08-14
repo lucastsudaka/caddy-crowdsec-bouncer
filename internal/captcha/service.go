@@ -1,21 +1,8 @@
-// Copyright 2026 Herman Slatman
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package captcha
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"errors"
 	"html/template"
 	"io"
@@ -36,6 +23,7 @@ const (
 	maximumReturnURIBytes    = 2048
 	maximumCanonicalHostByte = 255
 	maximumConcurrentChecks  = 64
+	maximumChecksPerClient   = 4
 	captchaProfileVersion    = "v1"
 )
 
@@ -235,7 +223,7 @@ type Service struct {
 	httpClient           HTTPClient
 	clock                Clock
 	verificationEndpoint string
-	verificationSlots    chan struct{}
+	verificationLimiter  *verificationLimiter
 	nonceGenerator       func() (string, error)
 	profileBinding       string
 	template             *template.Template
@@ -288,7 +276,7 @@ func New(config Config, options ...Option) (*Service, error) {
 		httpClient:           serviceOptions.httpClient,
 		clock:                serviceOptions.clock,
 		verificationEndpoint: serviceOptions.verificationEndpoint,
-		verificationSlots:    make(chan struct{}, maximumConcurrentChecks),
+		verificationLimiter:  newVerificationLimiter(maximumConcurrentChecks, maximumChecksPerClient),
 		nonceGenerator:       serviceOptions.nonceGenerator,
 		profileBinding:       captchaProfileVersion + "\x00" + string(config.Provider) + "\x00" + config.SiteKey,
 		template:             tmpl,
@@ -347,16 +335,21 @@ func (s *Service) Handle(w http.ResponseWriter, r *http.Request, info RequestInf
 			closeRequestBody(r)
 			return OutcomeFallback, ErrInvalidSubmission
 		}
+		returnURI, ok := returnURIFromSubmission(r.URL)
+		if !ok || subtle.ConstantTimeCompare([]byte(claims.ReturnTag), []byte(s.returnURITag(returnURI))) != 1 {
+			closeRequestBody(r)
+			return OutcomeFallback, ErrInvalidSubmission
+		}
 
 		token, ok := readSubmission(w, r, s.spec.responseField, s.spec.maximumTokenBytes)
 		if !ok {
-			return s.writeChallenge(w, r, host, info, claims.ReturnURI, true)
+			return s.writeChallenge(w, r, host, info, returnURI, true)
 		}
 		switch s.verify(r.Context(), token, host, info.ClientIP) {
 		case verificationAccepted:
-			return s.writePassedRedirect(w, r, host, info, claims.ReturnURI)
+			return s.writePassedRedirect(w, r, host, info, returnURI)
 		case verificationRejected:
-			return s.writeChallenge(w, r, host, info, claims.ReturnURI, true)
+			return s.writeChallenge(w, r, host, info, returnURI, true)
 		case verificationUnavailable:
 			return OutcomeFallback, ErrProviderUnavailable
 		default:
@@ -470,7 +463,7 @@ func (s *Service) writePassedRedirect(
 	if !ok {
 		return OutcomeFallback, ErrInvalidRequestContext
 	}
-	cookie, err := s.newCookie(r, cookieStatePassed, host, info, returnURI)
+	cookie, err := s.newCookie(r, cookieStatePassed, host, info, "")
 	if err != nil {
 		return OutcomeFallback, ErrRenderChallenge
 	}
@@ -549,8 +542,16 @@ func rawQueryContainsKey(rawQuery, wanted string) bool {
 }
 
 func safeReturnURI(requestURL *url.URL) string {
-	if requestURL == nil {
+	uri, ok := relativeRequestURI(requestURL)
+	if !ok {
 		return "/"
+	}
+	return uri
+}
+
+func relativeRequestURI(requestURL *url.URL) (string, bool) {
+	if requestURL == nil {
+		return "", false
 	}
 	copyURL := *requestURL
 	copyURL.Scheme = ""
@@ -562,9 +563,9 @@ func safeReturnURI(requestURL *url.URL) string {
 	}
 	uri := copyURL.RequestURI()
 	if _, ok := validateReturnURI(uri); !ok {
-		return "/"
+		return "", false
 	}
-	return uri
+	return uri, true
 }
 
 func submissionURI(returnURI string) (string, bool) {
@@ -576,18 +577,55 @@ func submissionURI(returnURI string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	if _, err := url.ParseQuery(parsed.RawQuery); err != nil {
+		return "", false
+	}
 	if rawQueryContainsKey(parsed.RawQuery, submissionQueryKey) {
 		return "", false
 	}
-	marker := url.QueryEscape(submissionQueryKey) + "=" + url.QueryEscape(submissionQueryValue)
+	marker := encodedSubmissionMarker()
 	if parsed.RawQuery == "" {
-		parsed.RawQuery = marker
+		if parsed.ForceQuery {
+			parsed.RawQuery = "&" + marker
+		} else {
+			parsed.RawQuery = marker
+		}
 	} else {
 		parsed.RawQuery += "&" + marker
 	}
 	uri := parsed.RequestURI()
 	_, ok = validateReturnURI(uri)
 	return uri, ok
+}
+
+// returnURIFromSubmission removes the exact marker appended by submissionURI
+// while leaving the original path and raw query representation untouched.
+func returnURIFromSubmission(requestURL *url.URL) (string, bool) {
+	present, valid := submissionMarker(requestURL)
+	if !present || !valid {
+		return "", false
+	}
+
+	marker := encodedSubmissionMarker()
+	copyURL := *requestURL
+	switch {
+	case copyURL.RawQuery == marker:
+		copyURL.RawQuery = ""
+		copyURL.ForceQuery = false
+	case copyURL.RawQuery == "&"+marker:
+		copyURL.RawQuery = ""
+		copyURL.ForceQuery = true
+	case strings.HasSuffix(copyURL.RawQuery, "&"+marker):
+		copyURL.RawQuery = strings.TrimSuffix(copyURL.RawQuery, "&"+marker)
+	default:
+		return "", false
+	}
+
+	return relativeRequestURI(&copyURL)
+}
+
+func encodedSubmissionMarker() string {
+	return url.QueryEscape(submissionQueryKey) + "=" + url.QueryEscape(submissionQueryValue)
 }
 
 func validateReturnURI(raw string) (string, bool) {

@@ -1,22 +1,10 @@
-// Copyright 2026 Herman Slatman
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package captcha
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"html"
 	"io"
@@ -132,6 +120,29 @@ func submitRequest(t *testing.T, rawURL, responseField, token string, cookie *ht
 		request.AddCookie(cookie)
 	}
 	return request
+}
+
+func assertCookieOmitsNavigationData(t *testing.T, cookie *http.Cookie, sensitiveValues ...string) map[string]json.RawMessage {
+	t.Helper()
+	encodedPayload, _, found := strings.Cut(cookie.Value, ".")
+	require.True(t, found)
+	payload, err := base64.RawURLEncoding.DecodeString(encodedPayload)
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(payload, &fields))
+	assert.NotContains(t, fields, "r")
+	for _, value := range sensitiveValues {
+		assert.NotContains(t, string(payload), value)
+	}
+	return fields
+}
+
+func assertVerificationLimiterIdle(t *testing.T, limiter *verificationLimiter) {
+	t.Helper()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	assert.Zero(t, limiter.globalInFlight)
+	assert.Empty(t, limiter.clientInFlight)
 }
 
 func TestServiceDisabled(t *testing.T) {
@@ -370,8 +381,10 @@ func TestSuccessfulSubmissionAndBypass(t *testing.T) {
 		}, nil
 	})
 	service := newTestService(t, ProviderHCaptcha, clock, WithRoundTripper(transport))
-	const originalURI = "https://example.com/private?b=2&a=%2F+%20&b=1"
+	const originalURI = "https://example.com/private-cookie-leak?token=super-secret-navigation-token&b=2&a=%2F+%20&b=1"
 	pendingCookie := challenge(t, service, originalURI, true)
+	pendingFields := assertCookieOmitsNavigationData(t, pendingCookie, "private-cookie-leak", "super-secret-navigation-token")
+	assert.Contains(t, pendingFields, "rt")
 	request := submitRequest(t, originalURI, "h-captcha-response", "browser-token", pendingCookie)
 	request.TLS = &tls.ConnectionState{}
 	recorder := httptest.NewRecorder()
@@ -380,7 +393,7 @@ func TestSuccessfulSubmissionAndBypass(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, OutcomeSolved, outcome)
 	assert.Equal(t, http.StatusSeeOther, recorder.Code)
-	assert.Equal(t, "/private?b=2&a=%2F+%20&b=1", recorder.Header().Get("Location"))
+	assert.Equal(t, "/private-cookie-leak?token=super-secret-navigation-token&b=2&a=%2F+%20&b=1", recorder.Header().Get("Location"))
 	assert.Equal(t, testSecretKey, capturedValues.Get("secret"))
 	assert.Equal(t, "browser-token", capturedValues.Get("response"))
 	assert.Equal(t, requestInfo().ClientIP.String(), capturedValues.Get("remoteip"))
@@ -389,6 +402,8 @@ func TestSuccessfulSubmissionAndBypass(t *testing.T) {
 	passedCookies := recorder.Result().Cookies()
 	require.Len(t, passedCookies, 1)
 	assert.Equal(t, testNow.Add(DefaultPassedExpiration), passedCookies[0].Expires)
+	passedFields := assertCookieOmitsNavigationData(t, passedCookies[0], "private-cookie-leak", "super-secret-navigation-token")
+	assert.NotContains(t, passedFields, "rt")
 
 	normalRequest := httptest.NewRequest(http.MethodGet, originalURI, nil)
 	normalRequest.AddCookie(passedCookies[0])
@@ -658,6 +673,12 @@ func TestInvalidSubmissionEnvelopeFallsBackWithoutWritingOrVerifying(t *testing.
 				return submitRequest(t, "https://example.com/private", "cf-turnstile-response", "proof", nil)
 			},
 		},
+		{
+			name: "submission URI does not match pending challenge",
+			request: func() *http.Request {
+				return submitRequest(t, "https://example.com/other?a=b", "cf-turnstile-response", "proof", pendingCookie)
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -690,7 +711,7 @@ func TestInvalidProofReChallengesWithoutProviderCall(t *testing.T) {
 		{
 			name: "wrong content type",
 			request: func() *http.Request {
-				request := submitRequest(t, "https://example.com/private", "cf-turnstile-response", "proof", pendingCookie)
+				request := submitRequest(t, "https://example.com/private?a=b", "cf-turnstile-response", "proof", pendingCookie)
 				request.Header.Set("Content-Type", "application/json")
 				return request
 			},
@@ -698,14 +719,14 @@ func TestInvalidProofReChallengesWithoutProviderCall(t *testing.T) {
 		{
 			name: "missing token",
 			request: func() *http.Request {
-				return submitRequest(t, "https://example.com/private", "wrong-response-field", "proof", pendingCookie)
+				return submitRequest(t, "https://example.com/private?a=b", "wrong-response-field", "proof", pendingCookie)
 			},
 		},
 		{
 			name: "oversized body",
 			request: func() *http.Request {
 				body := strings.NewReader(strings.Repeat("x", maximumSubmissionBytes+1))
-				request := httptest.NewRequest(http.MethodPost, "https://example.com/private?__crowdsec_captcha=verify", body)
+				request := httptest.NewRequest(http.MethodPost, "https://example.com/private?a=b&__crowdsec_captcha=verify", body)
 				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 				request.AddCookie(pendingCookie)
 				return request
@@ -874,6 +895,7 @@ func TestProviderTimeout(t *testing.T) {
 	outcome, err := service.Handle(recorder, request, requestInfo())
 	assert.Equal(t, OutcomeFallback, outcome)
 	assert.ErrorIs(t, err, ErrProviderUnavailable)
+	assertVerificationLimiterIdle(t, service.verificationLimiter)
 }
 
 func TestProviderConcurrencyIsBounded(t *testing.T) {
@@ -888,9 +910,17 @@ func TestProviderConcurrencyIsBounded(t *testing.T) {
 			Request:    request,
 		}, nil
 	})))
-	for range maximumConcurrentChecks {
-		service.verificationSlots <- struct{}{}
+	occupied := make([]netip.Addr, 0, maximumConcurrentChecks)
+	for index := range maximumConcurrentChecks {
+		clientIP := netip.AddrFrom4([4]byte{198, 51, 100, byte(index + 1)})
+		require.True(t, service.verificationLimiter.acquire(clientIP))
+		occupied = append(occupied, clientIP)
 	}
+	t.Cleanup(func() {
+		for _, clientIP := range occupied {
+			service.verificationLimiter.release(clientIP)
+		}
+	})
 
 	pending := challenge(t, service, "https://example.com/private", true)
 	request := submitRequest(t, "https://example.com/private", service.spec.responseField, "valid-token", pending)
@@ -899,6 +929,72 @@ func TestProviderConcurrencyIsBounded(t *testing.T) {
 	require.ErrorIs(t, err, ErrProviderUnavailable)
 	assert.Equal(t, OutcomeFallback, outcome)
 	assert.Zero(t, calls.Load())
+}
+
+func TestProviderConcurrencyIsolatedPerClient(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan string, maximumChecksPerClient+1)
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	releaseProvider := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(releaseProvider)
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		started <- values.Get("remoteip")
+		select {
+		case <-unblock:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"success":true,"hostname":"example.com","action":"crowdsec"}`)),
+			Request:    request,
+		}, nil
+	})
+	service := newTestService(t, ProviderTurnstile, &fakeClock{now: testNow}, WithRoundTripper(transport))
+	clientIP := requestInfo().ClientIP
+	otherIP := netip.MustParseAddr("192.0.2.43")
+	results := make(chan verificationResult, maximumChecksPerClient+1)
+
+	for range maximumChecksPerClient {
+		go func() {
+			results <- service.verify(context.Background(), "proof", "example.com", clientIP)
+		}()
+	}
+	for range maximumChecksPerClient {
+		select {
+		case startedIP := <-started:
+			require.Equal(t, clientIP.String(), startedIP)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for client verification to start")
+		}
+	}
+
+	assert.Equal(t, verificationUnavailable, service.verify(context.Background(), "proof", "example.com", clientIP))
+	go func() {
+		results <- service.verify(context.Background(), "proof", "example.com", otherIP)
+	}()
+	select {
+	case startedIP := <-started:
+		require.Equal(t, otherIP.String(), startedIP)
+	case <-time.After(time.Second):
+		t.Fatal("another client was blocked by the saturated client")
+	}
+
+	releaseProvider()
+	for range maximumChecksPerClient + 1 {
+		assert.Equal(t, verificationAccepted, <-results)
+	}
+	assertVerificationLimiterIdle(t, service.verificationLimiter)
 }
 
 func TestProviderRedirectIsNotFollowed(t *testing.T) {
@@ -1054,6 +1150,25 @@ func TestDuplicateCookieNeverBypasses(t *testing.T) {
 	assert.Equal(t, OutcomeChallenge, outcome)
 }
 
+func TestLegacyCookieVersionNeverBypasses(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeClock{now: testNow}
+	service := newTestService(t, ProviderTurnstile, clock)
+	claims := cookieClaims{
+		Version: cookieVersion - 1, State: cookieStatePassed, Host: "example.com", IP: requestInfo().ClientIP.String(),
+		IssuedAt: testNow.Unix(), ExpiresAt: testNow.Add(time.Hour).Unix(), Binding: service.bindingTag(requestInfo().Binding),
+	}
+	value, err := service.signClaims(claims)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, "https://example.com/private", nil)
+	request.AddCookie(&http.Cookie{Name: CookieName, Value: value})
+
+	outcome, err := service.Handle(httptest.NewRecorder(), request, requestInfo())
+	require.NoError(t, err)
+	assert.Equal(t, OutcomeChallenge, outcome)
+}
+
 func TestSubmissionHelpersAndSafeRedirects(t *testing.T) {
 	t.Parallel()
 
@@ -1088,6 +1203,42 @@ func TestSubmissionHelpersAndSafeRedirects(t *testing.T) {
 		got, ok := validateReturnURI(raw)
 		assert.True(t, ok, raw)
 		assert.Equal(t, raw, got)
+	}
+
+	const original = "/a%2Fb?b=2&a=%2F+%20&empty=&flag&text=__crowdsec_captcha"
+	action, ok := submissionURI(original)
+	require.True(t, ok)
+	actionURL, err := url.ParseRequestURI(action)
+	require.NoError(t, err)
+	got, ok := returnURIFromSubmission(actionURL)
+	require.True(t, ok)
+	assert.Equal(t, original, got)
+	forcedQueryAction, ok := submissionURI("/empty?")
+	require.True(t, ok)
+	forcedQueryURL, err := url.ParseRequestURI(forcedQueryAction)
+	require.NoError(t, err)
+	got, ok = returnURIFromSubmission(forcedQueryURL)
+	require.True(t, ok)
+	assert.Equal(t, "/empty?", got)
+
+	for _, raw := range []string{
+		"/a?__crowdsec_captcha=verify&x=1",
+		"/a?%5f%5fcrowdsec_captcha=verify",
+		"/a?__crowdsec_captcha=verify&__crowdsec_captcha=verify",
+		"/a?__crowdsec_captcha=nope",
+	} {
+		parsed, parseErr := url.ParseRequestURI(raw)
+		require.NoError(t, parseErr)
+		_, valid := returnURIFromSubmission(parsed)
+		assert.False(t, valid, raw)
+	}
+	for _, raw := range []string{
+		"/a?__crowdsec_captcha=verify",
+		"/a?%5f%5fcrowdsec_captcha=verify",
+		"/a?bad=%zz",
+	} {
+		_, valid := submissionURI(raw)
+		assert.False(t, valid, raw)
 	}
 	assert.False(t, IsSubmission(nil))
 }
@@ -1143,7 +1294,7 @@ func TestConcurrentBypassValidation(t *testing.T) {
 	service := newTestService(t, ProviderTurnstile, clock)
 	claims := cookieClaims{
 		Version: cookieVersion, State: cookieStatePassed, Host: "example.com", IP: requestInfo().ClientIP.String(),
-		IssuedAt: testNow.Unix(), ExpiresAt: testNow.Add(time.Hour).Unix(), ReturnURI: "/", Binding: service.bindingTag(requestInfo().Binding),
+		IssuedAt: testNow.Unix(), ExpiresAt: testNow.Add(time.Hour).Unix(), Binding: service.bindingTag(requestInfo().Binding),
 	}
 	value, err := service.signClaims(claims)
 	require.NoError(t, err)

@@ -1,17 +1,3 @@
-// Copyright 2026 Herman Slatman
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package captcha
 
 import (
@@ -29,7 +15,8 @@ const (
 	// CookieName is the host-only cookie managed by Service.
 	CookieName = "crowdsec_captcha"
 
-	cookieVersion       = 1
+	// Version 2 replaces the encoded return URI with an opaque pending-only tag.
+	cookieVersion       = 2
 	maximumCookieBytes  = 4096
 	maximumBindingBytes = 512
 	allowedClockSkew    = time.Minute
@@ -49,11 +36,17 @@ type cookieClaims struct {
 	IP        string      `json:"ip"`
 	IssuedAt  int64       `json:"iat"`
 	ExpiresAt int64       `json:"exp"`
-	ReturnURI string      `json:"r"`
 	Binding   string      `json:"b"`
+	ReturnTag string      `json:"rt,omitempty"`
 }
 
-func (s *Service) newCookie(r *http.Request, state cookieState, host string, info RequestInfo, returnURI string) (*http.Cookie, error) {
+func (s *Service) newCookie(
+	r *http.Request,
+	state cookieState,
+	host string,
+	info RequestInfo,
+	pendingReturnURI string,
+) (*http.Cookie, error) {
 	now := s.clock.Now().UTC()
 	lifetime := defaultPendingExpiration
 	if state == cookieStatePassed {
@@ -68,8 +61,10 @@ func (s *Service) newCookie(r *http.Request, state cookieState, host string, inf
 		IP:        info.ClientIP.String(),
 		IssuedAt:  now.Unix(),
 		ExpiresAt: expires.Unix(),
-		ReturnURI: returnURI,
 		Binding:   s.bindingTag(info.Binding),
+	}
+	if state == cookieStatePending {
+		claims.ReturnTag = s.returnURITag(pendingReturnURI)
 	}
 	value, err := s.signClaims(claims)
 	if err != nil {
@@ -129,10 +124,6 @@ func (s *Service) readClaims(r *http.Request, host string, info RequestInfo) (co
 	if subtle.ConstantTimeCompare([]byte(claims.Binding), []byte(s.bindingTag(info.Binding))) != 1 {
 		return cookieClaims{}, false
 	}
-	if _, ok := validateReturnURI(claims.ReturnURI); !ok {
-		return cookieClaims{}, false
-	}
-
 	now := s.clock.Now().UTC()
 	issuedAt := time.Unix(claims.IssuedAt, 0)
 	expiresAt := time.Unix(claims.ExpiresAt, 0)
@@ -143,8 +134,14 @@ func (s *Service) readClaims(r *http.Request, host string, info RequestInfo) (co
 	var maximumLifetime time.Duration
 	switch claims.State {
 	case cookieStatePending:
+		if !validReturnTag(claims.ReturnTag) {
+			return cookieClaims{}, false
+		}
 		maximumLifetime = defaultPendingExpiration
 	case cookieStatePassed:
+		if claims.ReturnTag != "" {
+			return cookieClaims{}, false
+		}
 		maximumLifetime = s.passedExpiration
 	default:
 		return cookieClaims{}, false
@@ -200,4 +197,16 @@ func (s *Service) bindingTag(binding string) string {
 	_, _ = mac.Write([]byte("\x00"))
 	_, _ = mac.Write([]byte(binding))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Service) returnURITag(returnURI string) string {
+	mac := hmac.New(sha256.New, s.signingKey)
+	_, _ = mac.Write([]byte("crowdsec-captcha-return-uri\x00"))
+	_, _ = mac.Write([]byte(returnURI))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validReturnTag(tag string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(tag)
+	return err == nil && len(decoded) == sha256.Size
 }

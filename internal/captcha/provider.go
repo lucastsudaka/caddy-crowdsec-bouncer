@@ -1,17 +1,3 @@
-// Copyright 2026 Herman Slatman
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package captcha
 
 import (
@@ -23,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 const maximumVerificationResponseBytes = 64 << 10
@@ -97,15 +84,57 @@ type verificationResponse struct {
 	ErrorCodes []string `json:"error-codes"`
 }
 
+// verificationLimiter bounds both total provider calls and the share that a
+// single client can occupy. Its map contains only clients with calls in flight,
+// so memory use is bounded by the global limit and no state must be shared
+// across replicas.
+type verificationLimiter struct {
+	mu             sync.Mutex
+	globalLimit    int
+	perClientLimit int
+	globalInFlight int
+	clientInFlight map[netip.Addr]int
+}
+
+func newVerificationLimiter(globalLimit, perClientLimit int) *verificationLimiter {
+	return &verificationLimiter{
+		globalLimit:    globalLimit,
+		perClientLimit: perClientLimit,
+		clientInFlight: make(map[netip.Addr]int),
+	}
+}
+
+func (limiter *verificationLimiter) acquire(clientIP netip.Addr) bool {
+	clientIP = clientIP.Unmap()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	if limiter.globalInFlight >= limiter.globalLimit || limiter.clientInFlight[clientIP] >= limiter.perClientLimit {
+		return false
+	}
+	limiter.globalInFlight++
+	limiter.clientInFlight[clientIP]++
+	return true
+}
+
+func (limiter *verificationLimiter) release(clientIP netip.Addr) {
+	clientIP = clientIP.Unmap()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	if limiter.clientInFlight[clientIP] <= 1 {
+		delete(limiter.clientInFlight, clientIP)
+	} else {
+		limiter.clientInFlight[clientIP]--
+	}
+	limiter.globalInFlight--
+}
+
 func (s *Service) verify(ctx context.Context, token, host string, clientIP netip.Addr) verificationResult {
-	select {
-	case s.verificationSlots <- struct{}{}:
-		defer func() { <-s.verificationSlots }()
-	case <-ctx.Done():
-		return verificationUnavailable
-	default:
+	if ctx.Err() != nil || !s.verificationLimiter.acquire(clientIP) {
 		return verificationUnavailable
 	}
+	defer s.verificationLimiter.release(clientIP)
 
 	values := make(url.Values, 3)
 	values.Set("secret", s.secretKey)
