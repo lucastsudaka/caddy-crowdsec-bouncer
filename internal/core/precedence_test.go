@@ -151,12 +151,14 @@ func Test_selectDecision(t *testing.T) {
 			wantID: 2,
 		},
 		{
-			name: "equal-rank decisions keep the first",
+			// both decisions share the exact LAPI (scope, type, value) key, so
+			// the group upsert keeps the member the default stream ends on
+			name: "equal-key decisions end on the larger ID",
 			decisions: []*models.Decision{
 				newTestDecision(1, "ban"),
 				newTestDecision(2, "ban"),
 			},
-			wantID: 1,
+			wantID: 2,
 		},
 		{
 			name: "nil entries fail closed",
