@@ -106,39 +106,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// TODO: if the IP is allowed, should we (temporarily) put it in an explicit allowlist for quicker check?
 
 	if !isAllowed {
-		typ := "ban"
-		value := ip.String()
-		duration := ""
-		origin := "unknown"
-		if decision != nil {
-			if decision.Type != nil {
-				typ = *decision.Type
-			}
-			if decision.Value != nil {
-				value = *decision.Value
-			}
-			if decision.Duration != nil {
-				duration = *decision.Duration
-			}
-			if decision.Origin != nil {
-				origin = *decision.Origin
-			}
-		}
-		typ = strings.ToLower(strings.TrimSpace(typ))
+		// TODO: maybe some configuration to override the type of action with a ban, some default, something like that?
+		// TODO: can we provide the reason for the response to the Caddy logger, like the CrowdSec type, duration, etc.
+		typ := *decision.Type
+		value := *decision.Value
+		duration := *decision.Duration
+		origin := *decision.Origin
 
-		if typ == "captcha" {
+		if strings.EqualFold(strings.TrimSpace(typ), "captcha") {
 			handled, err := h.handleCaptcha(w, r, ip, server, origin)
 			if err != nil || handled {
 				return err
 			}
 		} else {
-			remediation := httputils.FallbackRemediation(typ)
 			if err := httputils.WriteResponse(w, h.logger, typ, value, duration, 0, h.crowdsec.EnableCaddyError); err != nil {
-				h.crowdsec.IncrementBlockedRequests(server, origin, remediation, ip.Is6())
+				h.crowdsec.IncrementBlockedRequests(server, origin, typ, ip.Is6()) // TODO: properly set the action that was performed
 				return err
 			}
 
-			h.crowdsec.IncrementBlockedRequests(server, origin, remediation, ip.Is6())
+			h.crowdsec.IncrementBlockedRequests(server, origin, typ, ip.Is6()) // TODO: properly set the action that was performed
 			return nil
 		}
 	}

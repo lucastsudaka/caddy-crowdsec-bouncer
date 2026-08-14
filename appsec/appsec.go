@@ -116,25 +116,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			return err
 		}
 
-		action := strings.ToLower(strings.TrimSpace(a.Action))
-		switch action {
-		case "allow":
-			// nothing to do
-		case "log":
-			h.logger.Info("appsec rule triggered", zap.String("ip", ip.String()), zap.String("action", a.Action))
-		case "captcha":
+		switch {
+		case strings.EqualFold(strings.TrimSpace(a.Action), "captcha"):
 			handled, err := h.handleCaptcha(w, r, ip, server, module, a.StatusCode)
 			if err != nil || handled {
 				return err
 			}
+		case a.Action == "allow":
+			// nothing to do
+			h.crowdsec.IncrementBlockedRequests(server, module, "bypass", ip.Is6()) // TODO: properly set the action that was performed
+		case a.Action == "log":
+			h.logger.Info("appsec rule triggered", zap.String("ip", ip.String()), zap.String("action", a.Action))
+			h.crowdsec.IncrementBlockedRequests(server, module, "log", ip.Is6()) // TODO: properly set the action that was performed
 		default:
-			remediation := httputils.FallbackRemediation(action)
-			if err := httputils.WriteResponse(w, h.logger, action, ip.String(), a.Duration, a.StatusCode, h.crowdsec.EnableCaddyError); err != nil {
-				h.crowdsec.IncrementBlockedRequests(server, module, remediation, ip.Is6())
+			if err := httputils.WriteResponse(w, h.logger, a.Action, ip.String(), a.Duration, a.StatusCode, h.crowdsec.EnableCaddyError); err != nil {
+				h.crowdsec.IncrementBlockedRequests(server, module, a.Action, ip.Is6()) // TODO: properly set the action that was performed
 				return err
 			}
 
-			h.crowdsec.IncrementBlockedRequests(server, module, remediation, ip.Is6())
+			h.crowdsec.IncrementBlockedRequests(server, module, a.Action, ip.Is6()) // TODO: properly set the action that was performed
 			return nil
 		}
 	}

@@ -60,7 +60,7 @@ func (t *providerTransport) RoundTrip(r *nethttp.Request) (*nethttp.Response, er
 
 func TestHandlerCaptchaFlow(t *testing.T) {
 	var decisionType atomic.Value
-	decisionType.Store("captcha")
+	decisionType.Store(" CAPTCHA ")
 	lapi := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
 		assert.Equal(t, "test-key", r.Header.Get("X-Api-Key"))
 		assert.Equal(t, testClientIP, r.URL.Query().Get("ip"))
@@ -213,6 +213,25 @@ func TestHandlerCaptchaWithoutConfigurationFallsBackToBan(t *testing.T) {
 		return nil
 	})))
 	assert.Equal(t, nethttp.StatusForbidden, w.Code)
+}
+
+func TestHandlerPreservesLegacyNonCaptchaActionMatching(t *testing.T) {
+	lapi := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, _ *nethttp.Request) {
+		_, _ = fmt.Fprintf(w, `[{"duration":"1h","id":1,"origin":"cscli","scenario":"test","scope":"Ip","type":"THROTTLE","value":%q}]`, testClientIP)
+	}))
+	defer lapi.Close()
+
+	cs, _ := newHandlerTestCrowdSec(t, lapi.URL, false)
+	handler := &Handler{crowdsec: cs, logger: zaptest.NewLogger(t)}
+	w := httptest.NewRecorder()
+	r := requestWithClientIP(httptest.NewRequest(nethttp.MethodGet, "http://example.com/protected", nil))
+
+	require.NoError(t, handler.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(nethttp.ResponseWriter, *nethttp.Request) error {
+		t.Fatal("a blocked request must not call the next handler")
+		return nil
+	})))
+	assert.Equal(t, nethttp.StatusForbidden, w.Code)
+	assert.Empty(t, w.Header().Get("Retry-After"))
 }
 
 func newHandlerTestCrowdSec(t *testing.T, apiURL string, configureCaptcha bool) (*crowdsec.CrowdSec, *providerTransport) {

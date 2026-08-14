@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -64,7 +63,6 @@ func determineIPFromRequest(ctx context.Context) (netip.Addr, error) {
 // WriteResponse writes a response to the [http.ResponseWriter] based on the typ, value,
 // duration and status code provide.
 func WriteResponse(w http.ResponseWriter, logger *zap.Logger, typ, value, duration string, statusCode int, useCaddyError bool) error {
-	typ = strings.ToLower(strings.TrimSpace(typ))
 	switch typ {
 	case "ban":
 		logger.Debug(fmt.Sprintf("serving ban response to %s", value))
@@ -80,18 +78,6 @@ func WriteResponse(w http.ResponseWriter, logger *zap.Logger, typ, value, durati
 		logger.Debug(fmt.Sprintf("serving ban response to %s", value))
 		return writeBanResponse(w, statusCode, useCaddyError)
 	}
-}
-
-// FallbackRemediation returns the remediation actually performed by
-// WriteResponse. CAPTCHA challenges are handled by the HTTP modules before
-// reaching WriteResponse; its captcha case deliberately remains a fail-closed
-// ban for unconfigured and non-HTTP callers.
-func FallbackRemediation(typ string) string {
-	if strings.EqualFold(strings.TrimSpace(typ), "throttle") {
-		return "throttle"
-	}
-
-	return "ban"
 }
 
 // writeBanResponse writes a 403 status as response

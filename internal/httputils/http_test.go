@@ -146,17 +146,11 @@ func TestWriteResponse_CaptchaFallback(t *testing.T) {
 	})
 }
 
-func TestFallbackRemediation(t *testing.T) {
-	tests := map[string]string{
-		"ban":       "ban",
-		"captcha":   "ban",
-		"throttle":  "throttle",
-		"something": "ban",
-	}
+func TestWriteResponsePreservesLegacyActionMatching(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	w := httptest.NewRecorder()
 
-	for typ, expected := range tests {
-		t.Run(typ, func(t *testing.T) {
-			assert.Equal(t, expected, FallbackRemediation(typ))
-		})
-	}
+	require.NoError(t, WriteResponse(w, logger, " THROTTLE ", "192.168.1.1", "10s", 0, false))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Empty(t, w.Header().Get("Retry-After"))
 }

@@ -60,7 +60,7 @@ func (t *appSecProviderTransport) RoundTrip(r *http.Request) (*http.Response, er
 func TestAppSecCaptchaFlow(t *testing.T) {
 	var action atomic.Value
 	var appSecCalls atomic.Int64
-	action.Store("captcha")
+	action.Store(" CAPTCHA ")
 	appSecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		appSecCalls.Add(1)
 		switch current := action.Load().(string); current {
@@ -155,6 +155,31 @@ func TestAppSecCaptchaUnsafeMethodFallsBackToBan(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "cf-turnstile")
 	assert.EqualValues(t, 1, appSecCalls.Load())
 	assert.Zero(t, transport.calls.Load())
+	assert.Zero(t, nextCalls)
+}
+
+func TestAppSecPreservesLegacyNonCaptchaActionMatching(t *testing.T) {
+	var action atomic.Value
+	action.Store("THROTTLE")
+	appSecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"action":"`+action.Load().(string)+`","http_status":403}`)
+	}))
+	defer appSecServer.Close()
+
+	cs, _ := newAppSecTestCrowdSec(t, appSecServer.URL)
+	handler := &Handler{crowdsec: cs, logger: zaptest.NewLogger(t)}
+	nextCalls := 0
+	w := httptest.NewRecorder()
+	r := appSecRequestWithClientIP(httptest.NewRequest(http.MethodGet, "http://example.com/protected", nil))
+
+	require.NoError(t, handler.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		nextCalls++
+		return nil
+	})))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Empty(t, w.Header().Get("Retry-After"))
 	assert.Zero(t, nextCalls)
 }
 
