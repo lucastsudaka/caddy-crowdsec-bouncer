@@ -115,9 +115,10 @@ func (o Outcome) String() string {
 	}
 }
 
-// RequestInfo binds a captcha proof to a client and the effective CrowdSec
-// decision. Binding must be a stable, non-empty identity selected by the
-// caller, such as a decision ID. It is stored in the cookie only as an HMAC.
+// RequestInfo binds a captcha proof to a client and a caller-defined clearance
+// domain. Binding must be stable and non-empty; callers may scope it to one
+// decision or deliberately share it across related captcha decisions. It is
+// stored in the cookie only as an HMAC.
 type RequestInfo struct {
 	ClientIP netip.Addr
 	Binding  string

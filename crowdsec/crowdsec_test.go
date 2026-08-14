@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -313,6 +314,9 @@ func TestCrowdSecProvisionRejectsIncompleteCaptchaConfig(t *testing.T) {
 		ctx, _ := caddy.NewContext(caddy.Context{Context: t.Context()})
 		err := c.Provision(ctx)
 		require.ErrorContains(t, err, "captcha_site_key must not be empty")
+		require.Nil(t, c.core)
+		require.NoError(t, c.Cleanup())
+		require.NoError(t, c.Stop())
 	})
 
 	t.Run("all environment placeholders missing", func(t *testing.T) {
@@ -335,7 +339,36 @@ func TestCrowdSecProvisionRejectsIncompleteCaptchaConfig(t *testing.T) {
 		ctx, _ := caddy.NewContext(caddy.Context{Context: t.Context()})
 		err := c.Provision(ctx)
 		require.ErrorContains(t, err, "resolved to empty values")
+		require.Nil(t, c.core)
+		require.NoError(t, c.Cleanup())
+		require.NoError(t, c.Stop())
 	})
+
+	t.Run("template load failure", func(t *testing.T) {
+		c := CrowdSec{
+			APIKey:              "test-key",
+			CaptchaProvider:     "turnstile",
+			CaptchaSiteKey:      "site-key",
+			CaptchaSecretKey:    "provider-secret",
+			CaptchaSigningKey:   "01234567890123456789012345678901",
+			CaptchaTemplatePath: filepath.Join(t.TempDir(), "missing.html"),
+		}
+
+		ctx, _ := caddy.NewContext(caddy.Context{Context: t.Context()})
+		err := c.Provision(ctx)
+		require.ErrorContains(t, err, "open template")
+		require.Nil(t, c.core)
+		require.NoError(t, c.Cleanup())
+		require.NoError(t, c.Stop())
+	})
+}
+
+func TestCrowdSecLifecycleWithoutProvisionedCore(t *testing.T) {
+	c := &CrowdSec{}
+
+	require.ErrorContains(t, c.Start(), "core instance not available")
+	require.NoError(t, c.Stop())
+	require.NoError(t, c.Cleanup())
 }
 
 func TestCrowdSecStreamingBouncerRuntime(t *testing.T) {

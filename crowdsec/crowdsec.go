@@ -327,21 +327,31 @@ func matchModules(moduleIdentifiers ...string) (modules []moduleInfo, err error)
 }
 
 func (c *CrowdSec) Cleanup() error {
+	if c.logger != nil {
+		defer func() {
+			_ = c.logger.Sync()
+		}()
+	}
+
+	// Caddy calls Cleanup even when Provision returns an error. CAPTCHA
+	// validation and template loading happen before the core is constructed, so
+	// an incomplete configuration can legitimately reach this point without a
+	// core instance.
+	if c.core == nil {
+		return nil
+	}
 	if err := c.core.Shutdown(); err != nil {
 		return fmt.Errorf("failed cleaning up: %w", err)
 	}
-
-	if c.logger == nil {
-		return nil
-	}
-
-	_ = c.logger.Sync()
 
 	return nil
 }
 
 // Start starts the CrowdSec Caddy app
 func (c *CrowdSec) Start() error {
+	if c.core == nil {
+		return errors.New("core instance not available")
+	}
 	if err := c.core.Init(); err != nil {
 		return err
 	}
@@ -353,6 +363,9 @@ func (c *CrowdSec) Start() error {
 
 // Stop stops the CrowdSec Caddy app
 func (c *CrowdSec) Stop() error {
+	if c.core == nil {
+		return nil
+	}
 	return c.core.Shutdown()
 }
 
