@@ -15,6 +15,7 @@
 package core
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/crowdsecurity/crowdsec/pkg/models"
@@ -75,7 +76,8 @@ func Test_selectDecision(t *testing.T) {
 	tests := []struct {
 		name      string
 		decisions []*models.Decision
-		wantID    int64 // 0 means "expect nil"
+		wantID    int64 // 0 means "expect no decision"
+		wantErr   bool  // a malformed entry fails closed unless the selection is fail-closed itself
 	}{
 		{
 			name:      "empty",
@@ -149,7 +151,7 @@ func Test_selectDecision(t *testing.T) {
 			wantID: 2,
 		},
 		{
-			name: "ties keep the first decision",
+			name: "equal-rank decisions keep the first",
 			decisions: []*models.Decision{
 				newTestDecision(1, "ban"),
 				newTestDecision(2, "ban"),
@@ -157,20 +159,20 @@ func Test_selectDecision(t *testing.T) {
 			wantID: 1,
 		},
 		{
-			name: "nil entries are skipped",
+			name: "nil entries fail closed",
 			decisions: []*models.Decision{
 				nil,
 				newTestDecision(1, "captcha"),
 			},
-			wantID: 1,
+			wantErr: true,
 		},
 		{
-			name: "invalid entries are skipped",
+			name: "invalid entries fail closed",
 			decisions: []*models.Decision{
 				{ID: 99}, // no Scope, Value or Type
 				newTestDecision(1, "captcha"),
 			},
-			wantID: 1,
+			wantErr: true,
 		},
 		{
 			name: "only invalid entries",
@@ -178,7 +180,7 @@ func Test_selectDecision(t *testing.T) {
 				nil,
 				{ID: 99},
 			},
-			wantID: 0,
+			wantErr: true,
 		},
 		{
 			name: "strictest of many",
@@ -194,7 +196,14 @@ func Test_selectDecision(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := selectDecision(tt.decisions)
+			got, err := selectDecision(netip.MustParseAddr("127.0.0.1"), tt.decisions)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
 
 			if tt.wantID == 0 {
 				assert.Nil(t, got)
