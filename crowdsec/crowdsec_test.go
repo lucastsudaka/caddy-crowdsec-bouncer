@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,6 +104,30 @@ func TestCrowdSecProvisions(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "captcha-json-env-vars",
+			config: `{
+				"api_key": "test-key",
+				"captcha_provider": "{env.CROWDSEC_TEST_CAPTCHA_PROVIDER}",
+				"captcha_site_key": "{env.CROWDSEC_TEST_CAPTCHA_SITE_KEY}",
+				"captcha_secret_key": "{env.CROWDSEC_TEST_CAPTCHA_SECRET_KEY}",
+				"captcha_signing_key": "{env.CROWDSEC_TEST_CAPTCHA_SIGNING_KEY}"
+			}`,
+			env: map[string]string{
+				"CROWDSEC_TEST_CAPTCHA_PROVIDER":    "TURNSTILE",
+				"CROWDSEC_TEST_CAPTCHA_SITE_KEY":    "site-key",
+				"CROWDSEC_TEST_CAPTCHA_SECRET_KEY":  "provider-secret",
+				"CROWDSEC_TEST_CAPTCHA_SIGNING_KEY": "01234567890123456789012345678901",
+			},
+			assertion: func(tt assert.TestingT, c *CrowdSec) {
+				assert.Equal(tt, "turnstile", c.CaptchaProvider)
+				assert.Equal(tt, "site-key", c.CaptchaSiteKey)
+				assert.Equal(tt, time.Hour, c.captchaExpiration())
+				assert.Equal(tt, 5*time.Second, c.captchaTimeout())
+				assert.NotNil(tt, c.captcha)
+			},
+			wantErr: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -170,6 +195,147 @@ func TestCrowdSecValidates(t *testing.T) {
 			assert.NoError(t, err)
 		})
 	}
+}
+
+func TestCaptchaConfigValidation(t *testing.T) {
+	valid := CrowdSec{
+		CaptchaProvider:   "turnstile",
+		CaptchaSiteKey:    "site-key",
+		CaptchaSecretKey:  "provider-secret",
+		CaptchaSigningKey: "01234567890123456789012345678901",
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*CrowdSec)
+		wantErr string
+	}{
+		{name: "disabled"},
+		{
+			name: "configured",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+			},
+		},
+		{
+			name: "missing-provider",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaProvider = ""
+			},
+			wantErr: "captcha_provider must not be empty",
+		},
+		{
+			name: "unsupported-provider",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaProvider = "other"
+			},
+			wantErr: "unsupported captcha provider",
+		},
+		{
+			name: "short-signing-key",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaSigningKey = "too-short"
+			},
+			wantErr: "at least 32 bytes",
+		},
+		{
+			name: "oversized-signing-key",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaSigningKey = strings.Repeat("k", 16385)
+			},
+			wantErr: "must not exceed 16384 bytes",
+		},
+		{
+			name: "reused-provider-secret",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaSecretKey = c.CaptchaSigningKey
+			},
+			wantErr: "must be different",
+		},
+		{
+			name: "negative-expiration",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaExpiration = caddy.Duration(-time.Second)
+			},
+			wantErr: "captcha_expiration must be positive",
+		},
+		{
+			name: "negative-timeout",
+			mutate: func(c *CrowdSec) {
+				*c = valid
+				c.CaptchaTimeout = caddy.Duration(-time.Second)
+			},
+			wantErr: "captcha_timeout must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c CrowdSec
+			if tt.mutate != nil {
+				tt.mutate(&c)
+			}
+
+			err := c.validateCaptchaConfig()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+
+	assert.Equal(t, time.Hour, valid.captchaExpiration())
+	assert.Equal(t, 5*time.Second, valid.captchaTimeout())
+}
+
+func TestHandleCaptchaBeforeProvisionIsUnavailable(t *testing.T) {
+	for _, c := range []*CrowdSec{nil, {}} {
+		outcome, err := c.HandleCaptcha(nil, nil, netip.Addr{})
+		require.NoError(t, err)
+		assert.Equal(t, CaptchaOutcomeUnavailable, outcome)
+	}
+}
+
+func TestCrowdSecProvisionRejectsIncompleteCaptchaConfig(t *testing.T) {
+	t.Run("partial values", func(t *testing.T) {
+		c := CrowdSec{
+			APIKey:          "test-key",
+			CaptchaProvider: "turnstile",
+		}
+
+		ctx, _ := caddy.NewContext(caddy.Context{Context: t.Context()})
+		err := c.Provision(ctx)
+		require.ErrorContains(t, err, "captcha_site_key must not be empty")
+	})
+
+	t.Run("all environment placeholders missing", func(t *testing.T) {
+		for _, name := range []string{
+			"CROWDSEC_MISSING_CAPTCHA_PROVIDER",
+			"CROWDSEC_MISSING_CAPTCHA_SITE_KEY",
+			"CROWDSEC_MISSING_CAPTCHA_SECRET_KEY",
+			"CROWDSEC_MISSING_CAPTCHA_SIGNING_KEY",
+		} {
+			t.Setenv(name, "")
+		}
+		c := CrowdSec{
+			APIKey:            "test-key",
+			CaptchaProvider:   "{env.CROWDSEC_MISSING_CAPTCHA_PROVIDER}",
+			CaptchaSiteKey:    "{env.CROWDSEC_MISSING_CAPTCHA_SITE_KEY}",
+			CaptchaSecretKey:  "{env.CROWDSEC_MISSING_CAPTCHA_SECRET_KEY}",
+			CaptchaSigningKey: "{env.CROWDSEC_MISSING_CAPTCHA_SIGNING_KEY}",
+		}
+
+		ctx, _ := caddy.NewContext(caddy.Context{Context: t.Context()})
+		err := c.Provision(ctx)
+		require.ErrorContains(t, err, "resolved to empty values")
+	})
 }
 
 func TestCrowdSecStreamingBouncerRuntime(t *testing.T) {

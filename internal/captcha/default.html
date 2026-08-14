@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security check</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: Canvas; color: CanvasText; }
+    main { width: min(32rem, calc(100% - 2rem)); text-align: center; }
+    form { display: grid; justify-items: center; gap: 1rem; }
+    button { padding: .6rem 1.2rem; cursor: pointer; }
+    .error { color: #b42318; }
+  </style>
+  <script src="{{.ScriptURL}}" async defer></script>
+</head>
+<body>
+  <main>
+    <h1>Security check</h1>
+    <p>Please complete the challenge to continue.</p>
+    {{if .Failed}}<p class="error" role="alert">The challenge was not accepted. Please try again.</p>{{end}}
+    <form method="post" action="{{.FormAction}}">
+      <div class="{{.WidgetClass}}" data-sitekey="{{.SiteKey}}"{{if .Action}} data-action="{{.Action}}"{{end}}></div>
+      <button type="submit">Continue</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -33,6 +33,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
+	"github.com/hslatman/caddy-crowdsec-bouncer/internal/captcha"
 	"github.com/hslatman/caddy-crowdsec-bouncer/internal/command"
 	"github.com/hslatman/caddy-crowdsec-bouncer/internal/core"
 )
@@ -87,6 +88,26 @@ type CrowdSec struct {
 	// EnableCaddyMetrics enables metrics maintained by the CrowdSec
 	// module to be emitted at Caddy's /metrics endpoint.
 	EnableCaddyMetrics *bool `json:"enable_caddy_metrics,omitempty"`
+	// CaptchaProvider selects the CAPTCHA service used for captcha decisions.
+	// Supported values are recaptcha, hcaptcha and turnstile. CAPTCHA support is
+	// disabled unless all required CAPTCHA options are configured.
+	CaptchaProvider string `json:"captcha_provider,omitempty"`
+	// CaptchaSiteKey is the public site key issued by the CAPTCHA provider.
+	CaptchaSiteKey string `json:"captcha_site_key,omitempty"`
+	// CaptchaSecretKey is the private verification key issued by the CAPTCHA
+	// provider.
+	CaptchaSecretKey string `json:"captcha_secret_key,omitempty"`
+	// CaptchaSigningKey signs the short-lived CAPTCHA state cookie. It must be a
+	// separate secret containing at least 32 bytes.
+	CaptchaSigningKey string `json:"captcha_signing_key,omitempty"`
+	// CaptchaTemplatePath optionally specifies a custom HTML challenge template.
+	CaptchaTemplatePath string `json:"captcha_template_path,omitempty"`
+	// CaptchaExpiration controls how long a successful CAPTCHA remains valid.
+	// Defaults to one hour.
+	CaptchaExpiration caddy.Duration `json:"captcha_expiration,omitempty"`
+	// CaptchaTimeout is the maximum time allowed for server-side verification
+	// with the CAPTCHA provider. Defaults to five seconds.
+	CaptchaTimeout caddy.Duration `json:"captcha_timeout,omitempty"`
 	// AppSecUrl is the URL of the AppSec component served by your
 	// CrowdSec installation. Disabled by default.
 	AppSecUrl string `json:"appsec_url,omitempty"`
@@ -103,9 +124,10 @@ type CrowdSec struct {
 	// being blocked.
 	AppSecFailOpen *bool `json:"appsec_fail_open,omitempty"`
 
-	ctx    caddy.Context
-	logger *zap.Logger
-	core   *core.Core
+	ctx     caddy.Context
+	logger  *zap.Logger
+	core    *core.Core
+	captcha *captcha.Service
 }
 
 // Provision sets up the CrowdSec app.
@@ -116,11 +138,21 @@ func (c *CrowdSec) Provision(ctx caddy.Context) error {
 		_ = c.logger.Sync()
 	}()
 
+	captchaRequested := c.captchaConfigured()
 	repl := caddy.NewReplacer() // create replacer with the default, global replacement functions, including ".env" env var reading
 	c.APIUrl = repl.ReplaceKnown(c.APIUrl, "")
 	c.APIKey = repl.ReplaceKnown(c.APIKey, "")
 	c.TickerInterval = repl.ReplaceKnown(c.TickerInterval, "")
+	c.CaptchaProvider = repl.ReplaceKnown(c.CaptchaProvider, "")
+	c.CaptchaProvider = strings.ToLower(strings.TrimSpace(c.CaptchaProvider))
+	c.CaptchaSiteKey = repl.ReplaceKnown(c.CaptchaSiteKey, "")
+	c.CaptchaSecretKey = repl.ReplaceKnown(c.CaptchaSecretKey, "")
+	c.CaptchaSigningKey = repl.ReplaceKnown(c.CaptchaSigningKey, "")
+	c.CaptchaTemplatePath = repl.ReplaceKnown(c.CaptchaTemplatePath, "")
 	c.AppSecUrl = repl.ReplaceKnown(c.AppSecUrl, "")
+	if captchaRequested && !c.captchaConfigured() {
+		return errors.New("CAPTCHA configuration resolved to empty values")
+	}
 
 	if c.APIUrl == "" {
 		c.APIUrl = "http://127.0.0.1:8080/"
@@ -128,6 +160,14 @@ func (c *CrowdSec) Provision(ctx caddy.Context) error {
 	if c.TickerInterval == "" {
 		c.TickerInterval = "60s"
 	}
+	if err := c.validateCaptchaConfig(); err != nil {
+		return err
+	}
+	captchaService, err := captcha.New(c.captchaConfig())
+	if err != nil {
+		return fmt.Errorf("provisioning CAPTCHA support: %w", err)
+	}
+	c.captcha = captchaService
 
 	var registry *prometheus.Registry
 	if c.enableCaddyMetrics() {
@@ -148,6 +188,9 @@ func (c *CrowdSec) Provision(ctx caddy.Context) error {
 func (c *CrowdSec) Validate() error {
 	if c.APIKey == "" {
 		return errors.New("crowdsec API key must not be empty")
+	}
+	if err := c.validateCaptchaConfig(); err != nil {
+		return err
 	}
 	if c.core == nil {
 		return errors.New("core instance not available due to (potential) misconfiguration")
@@ -364,6 +407,83 @@ func (c *CrowdSec) isAppSecFailOpenEnabled() bool {
 
 func (c *CrowdSec) appSecMaxBodySize() int {
 	return c.AppSecMaxBodySize
+}
+
+func (c *CrowdSec) captchaConfigured() bool {
+	return c.CaptchaProvider != "" ||
+		c.CaptchaSiteKey != "" ||
+		c.CaptchaSecretKey != "" ||
+		c.CaptchaSigningKey != "" ||
+		c.CaptchaTemplatePath != "" ||
+		c.CaptchaExpiration != 0 ||
+		c.CaptchaTimeout != 0
+}
+
+func (c *CrowdSec) validateCaptchaConfig() error {
+	if !c.captchaConfigured() {
+		return nil
+	}
+
+	required := []struct {
+		name  string
+		value string
+	}{
+		{name: "captcha_provider", value: c.CaptchaProvider},
+		{name: "captcha_site_key", value: c.CaptchaSiteKey},
+		{name: "captcha_secret_key", value: c.CaptchaSecretKey},
+		{name: "captcha_signing_key", value: c.CaptchaSigningKey},
+	}
+	for _, field := range required {
+		if field.value == "" {
+			return fmt.Errorf("%s must not be empty when CAPTCHA support is configured", field.name)
+		}
+	}
+
+	switch c.CaptchaProvider {
+	case "recaptcha", "hcaptcha", "turnstile":
+	default:
+		return fmt.Errorf("unsupported captcha provider %q", c.CaptchaProvider)
+	}
+
+	if len([]byte(c.CaptchaSigningKey)) < 32 {
+		return errors.New("captcha_signing_key must contain at least 32 bytes")
+	}
+	if len([]byte(c.CaptchaSigningKey)) > 16384 {
+		return errors.New("captcha_signing_key must not exceed 16384 bytes")
+	}
+	if c.CaptchaSigningKey == c.CaptchaSecretKey {
+		return errors.New("captcha_signing_key must be different from captcha_secret_key")
+	}
+	if c.CaptchaExpiration < 0 {
+		return errors.New("captcha_expiration must be positive")
+	}
+	if c.CaptchaExpiration > caddy.Duration(captcha.MaximumPassedExpiration) {
+		return fmt.Errorf("captcha_expiration must not exceed %s", captcha.MaximumPassedExpiration)
+	}
+	if c.CaptchaTimeout < 0 {
+		return errors.New("captcha_timeout must be positive")
+	}
+	if c.CaptchaTimeout > caddy.Duration(captcha.MaximumHTTPTimeout) {
+		return fmt.Errorf("captcha_timeout must not exceed %s", captcha.MaximumHTTPTimeout)
+	}
+
+	return nil
+}
+
+func (c *CrowdSec) captchaExpiration() time.Duration {
+	if c.CaptchaExpiration == 0 {
+		return time.Hour
+	}
+
+	return time.Duration(c.CaptchaExpiration)
+}
+
+func (c *CrowdSec) captchaTimeout() time.Duration {
+	if c.CaptchaTimeout == 0 {
+		return 5 * time.Second
+	}
+
+	return time.Duration(c.CaptchaTimeout)
 }
 
 func (c *CrowdSec) isStreamingEnabled() bool {

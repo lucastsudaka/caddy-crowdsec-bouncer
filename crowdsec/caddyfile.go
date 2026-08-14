@@ -11,6 +11,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+
+	"github.com/hslatman/caddy-crowdsec-bouncer/internal/captcha"
 )
 
 func parseCrowdSec(d *caddyfile.Dispenser, existingVal any) (any, error) {
@@ -91,6 +93,61 @@ func parseCrowdSec(d *caddyfile.Dispenser, existingVal any) (any, error) {
 				return nil, d.ArgErr()
 			}
 			cs.EnableCaddyError = true
+		case "captcha_provider":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			cs.CaptchaProvider = d.Val()
+		case "captcha_site_key":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			cs.CaptchaSiteKey = d.Val()
+		case "captcha_secret_key":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			cs.CaptchaSecretKey = d.Val()
+		case "captcha_signing_key":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			cs.CaptchaSigningKey = d.Val()
+		case "captcha_template_path":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			cs.CaptchaTemplatePath = d.Val()
+		case "captcha_expiration":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := time.ParseDuration(d.Val())
+			if err != nil {
+				return nil, d.Errf("invalid duration %q: %v", d.Val(), err)
+			}
+			if dur <= 0 {
+				return nil, d.Errf("captcha expiration must be positive: %s", d.Val())
+			}
+			if dur > captcha.MaximumPassedExpiration {
+				return nil, d.Errf("captcha expiration must not exceed %s", captcha.MaximumPassedExpiration)
+			}
+			cs.CaptchaExpiration = caddy.Duration(dur)
+		case "captcha_timeout":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := time.ParseDuration(d.Val())
+			if err != nil {
+				return nil, d.Errf("invalid duration %q: %v", d.Val(), err)
+			}
+			if dur <= 0 {
+				return nil, d.Errf("captcha timeout must be positive: %s", d.Val())
+			}
+			if dur > captcha.MaximumHTTPTimeout {
+				return nil, d.Errf("captcha timeout must not exceed %s", captcha.MaximumHTTPTimeout)
+			}
+			cs.CaptchaTimeout = caddy.Duration(dur)
 		case "appsec_url":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
