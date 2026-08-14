@@ -9,35 +9,20 @@
     body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: Canvas; color: CanvasText; }
     main { width: min(32rem, calc(100% - 2rem)); text-align: center; }
     form { display: grid; justify-items: center; gap: 1rem; }
+    button { padding: .6rem 1.2rem; cursor: pointer; }
     .error { color: #b42318; }
   </style>
-  <script nonce="{{.Nonce}}">
-    (function () {
-      "use strict";
-      var submitted = false;
-      window.crowdsecCaptchaSolved = function () {
-        if (submitted) return;
-        var form = document.getElementById("crowdsec-captcha-form");
-        if (!form) return;
-        submitted = true;
-        if (typeof form.requestSubmit === "function") {
-          form.requestSubmit();
-        } else {
-          HTMLFormElement.prototype.submit.call(form);
-        }
-      };
-    }());
-  </script>
   <script nonce="{{.Nonce}}" src="{{.ScriptURL}}" async defer></script>
 </head>
 <body>
   <main>
     <h1>Security check</h1>
-    <p>Please complete the challenge to continue.</p>
+    <p>Please complete the challenge and select Continue.</p>
     {{if .Failed}}<p class="error" role="alert">The challenge was not accepted. Please try again.</p>{{end}}
     <noscript><p class="error" role="alert">JavaScript is required to complete this security check.</p></noscript>
-    <form id="crowdsec-captcha-form" method="post" action="{{.FormAction}}">
-      <div class="{{.WidgetClass}}" data-sitekey="{{.SiteKey}}" data-callback="crowdsecCaptchaSolved"{{if .Action}} data-action="{{.Action}}"{{end}}></div>
+    <form method="post" action="{{.FormAction}}">
+      <div class="{{.WidgetClass}}" data-sitekey="{{.SiteKey}}"{{if .Action}} data-action="{{.Action}}"{{end}}></div>
+      <button type="submit">Continue</button>
     </form>
   </main>
 </body>

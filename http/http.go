@@ -164,9 +164,11 @@ func (h *Handler) handleCaptcha(w http.ResponseWriter, r *http.Request, ip netip
 	outcome, err := h.crowdsec.HandleCaptcha(w, r, ip)
 	switch outcome {
 	case crowdsec.CaptchaOutcomeChallenge:
+		h.logger.Debug("serving CAPTCHA challenge", zap.String("ip", ip.String()), zap.String("origin", origin))
 		h.crowdsec.IncrementBlockedRequests(server, origin, "captcha", ip.Is6())
 		return true, err
 	case crowdsec.CaptchaOutcomeSolved:
+		h.logger.Debug("CAPTCHA proof accepted", zap.String("ip", ip.String()), zap.String("origin", origin))
 		return true, err
 	case crowdsec.CaptchaOutcomeBypass:
 		return false, err

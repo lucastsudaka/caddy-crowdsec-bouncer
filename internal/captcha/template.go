@@ -15,12 +15,16 @@
 package captcha
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"fmt"
 	"html/template"
 	"io"
 	"os"
 )
+
+const scriptNonceBytes = 16
 
 //go:embed default.html
 var defaultTemplateFS embed.FS //nolint:gochecknoglobals // immutable embedded asset
@@ -28,7 +32,8 @@ var defaultTemplateFS embed.FS //nolint:gochecknoglobals // immutable embedded a
 // TemplateData is the data available to both the embedded challenge template
 // and Config.TemplatePath. ScriptURL and WidgetClass are fixed by Provider;
 // SiteKey is public provider configuration. FormAction is a same-origin URI
-// carrying the module's internal submission marker.
+// carrying the module's internal submission marker. Nonce authorizes trusted
+// inline scripts without relaxing the response Content Security Policy.
 type TemplateData struct {
 	Provider    Provider
 	SiteKey     string
@@ -36,7 +41,17 @@ type TemplateData struct {
 	WidgetClass string
 	Action      string
 	FormAction  string
+	Nonce       string
 	Failed      bool
+}
+
+func generateScriptNonce() (string, error) {
+	random := make([]byte, scriptNonceBytes)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("generate script nonce: %w", err)
+	}
+
+	return base64.RawStdEncoding.EncodeToString(random), nil
 }
 
 func loadTemplate(path string) (*template.Template, error) {

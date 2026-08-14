@@ -18,11 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -167,7 +169,14 @@ func TestChallengeResponse(t *testing.T) {
 			assert.Equal(t, "no-store, private", recorder.Header().Get("Cache-Control"))
 			assert.Equal(t, "nosniff", recorder.Header().Get("X-Content-Type-Options"))
 			assert.Equal(t, "DENY", recorder.Header().Get("X-Frame-Options"))
-			assert.NotEmpty(t, recorder.Header().Get("Content-Security-Policy"))
+			body := recorder.Body.String()
+			csp := recorder.Header().Get("Content-Security-Policy")
+			nonce := htmlAttribute(t, body, "nonce")
+			assert.Contains(t, csp, "'nonce-"+nonce+"'")
+			assert.Equal(t, 2, strings.Count(body, `nonce="`))
+			assert.Contains(t, body, `data-callback="crowdsecCaptchaSolved"`)
+			assert.Contains(t, body, "JavaScript is required")
+			assert.NotContains(t, body, `<button`)
 			assert.Contains(t, recorder.Body.String(), string(provider))
 			assert.Contains(t, recorder.Body.String(), testSiteKey)
 			assert.NotContains(t, recorder.Body.String(), testSecretKey)
@@ -177,7 +186,6 @@ func TestChallengeResponse(t *testing.T) {
 				assert.Contains(t, recorder.Body.String(), `data-action="crowdsec"`)
 			}
 			if provider == ProviderHCaptcha {
-				csp := recorder.Header().Get("Content-Security-Policy")
 				assert.Contains(t, csp, "https://hcaptcha.com")
 				assert.Contains(t, csp, "style-src 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com")
 			}
@@ -194,6 +202,81 @@ func TestChallengeResponse(t *testing.T) {
 			assert.Equal(t, testNow.Add(defaultPendingExpiration), cookie.Expires)
 		})
 	}
+}
+
+func htmlAttribute(t *testing.T, body, name string) string {
+	t.Helper()
+	marker := name + `="`
+	_, value, found := strings.Cut(body, marker)
+	require.True(t, found)
+	value, _, found = strings.Cut(value, `"`)
+	require.True(t, found)
+	require.NotEmpty(t, value)
+	return html.UnescapeString(value)
+}
+
+func TestChallengeNonceFailureFallsBackBeforeWriting(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name      string
+		generator func() (string, error)
+	}{
+		{
+			name: "entropy failure",
+			generator: func() (string, error) {
+				return "", errors.New("entropy unavailable")
+			},
+		},
+		{
+			name: "invalid nonce",
+			generator: func() (string, error) {
+				return "invalid nonce; script-src *", nil
+			},
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := newTestService(
+				t,
+				ProviderTurnstile,
+				&fakeClock{now: testNow},
+				withNonceGenerator(test.generator),
+			)
+			writer := &trackingResponseWriter{}
+			request := httptest.NewRequest(http.MethodGet, "https://example.com/private", nil)
+
+			outcome, err := service.Handle(writer, request, requestInfo())
+			require.ErrorIs(t, err, ErrRenderChallenge)
+			assert.Equal(t, OutcomeFallback, outcome)
+			assert.False(t, writer.wrote)
+			assert.Empty(t, writer.Header())
+		})
+	}
+}
+
+func TestManualTemplate(t *testing.T) {
+	t.Parallel()
+
+	config := validConfig(ProviderTurnstile)
+	config.TemplatePath = filepath.Join("..", "..", "examples", "captcha-templates", "manual.html")
+	service, err := New(
+		config,
+		WithClock(ClockFunc(func() time.Time { return testNow })),
+		withNonceGenerator(func() (string, error) { return "MDEyMzQ1Njc4OWFiY2RlZg", nil }),
+	)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, "https://example.com/private", nil)
+	recorder := httptest.NewRecorder()
+
+	outcome, err := service.Handle(recorder, request, requestInfo())
+	require.NoError(t, err)
+	assert.Equal(t, OutcomeChallenge, outcome)
+	assert.Contains(t, recorder.Body.String(), `<button type="submit">Continue</button>`)
+	assert.NotContains(t, recorder.Body.String(), `data-callback=`)
+	assert.Contains(t, recorder.Body.String(), `nonce="MDEyMzQ1Njc4OWFiY2RlZg"`)
+	assert.Contains(t, recorder.Header().Get("Content-Security-Policy"), "'nonce-MDEyMzQ1Njc4OWFiY2RlZg'")
 }
 
 func TestHeadChallengeDoesNotWriteBody(t *testing.T) {
@@ -470,6 +553,9 @@ func TestRejectedProofReChallenges(t *testing.T) {
 	assert.Equal(t, OutcomeChallenge, outcome)
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "not accepted")
+	assert.NotContains(t, recorder.Body.String(), `<button`)
+	assert.Contains(t, recorder.Body.String(), `data-callback="crowdsecCaptchaSolved"`)
+	assert.Equal(t, 2, strings.Count(recorder.Body.String(), `nonce="`))
 	assert.NotContains(t, recorder.Body.String(), "bad-proof")
 }
 

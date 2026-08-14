@@ -148,6 +148,7 @@ type serviceOptions struct {
 	httpClient           HTTPClient
 	clock                Clock
 	verificationEndpoint string
+	nonceGenerator       func() (string, error)
 }
 
 // Option customizes Service construction. Production callers normally need
@@ -207,6 +208,19 @@ func withVerificationEndpoint(endpoint string) Option {
 	}
 }
 
+// withNonceGenerator is intentionally package-private: production nonces are
+// always generated with crypto/rand. Tests may inject deterministic values or
+// failures without weakening the public API.
+func withNonceGenerator(generator func() (string, error)) Option {
+	return func(options *serviceOptions) error {
+		if generator == nil {
+			return errors.New("captcha: nonce generator must not be nil")
+		}
+		options.nonceGenerator = generator
+		return nil
+	}
+}
+
 // Service renders challenges, verifies provider tokens, and manages signed
 // proof cookies. It is immutable after New and safe for concurrent use.
 type Service struct {
@@ -221,6 +235,7 @@ type Service struct {
 	clock                Clock
 	verificationEndpoint string
 	verificationSlots    chan struct{}
+	nonceGenerator       func() (string, error)
 	profileBinding       string
 	template             *template.Template
 	spec                 providerSpec
@@ -235,8 +250,9 @@ func New(config Config, options ...Option) (*Service, error) {
 	}
 
 	serviceOptions := serviceOptions{
-		httpClient: newHTTPClient(http.DefaultTransport),
-		clock:      systemClock{},
+		httpClient:     newHTTPClient(http.DefaultTransport),
+		clock:          systemClock{},
+		nonceGenerator: generateScriptNonce,
 	}
 	for _, option := range options {
 		if option == nil {
@@ -272,6 +288,7 @@ func New(config Config, options ...Option) (*Service, error) {
 		clock:                serviceOptions.clock,
 		verificationEndpoint: serviceOptions.verificationEndpoint,
 		verificationSlots:    make(chan struct{}, maximumConcurrentChecks),
+		nonceGenerator:       serviceOptions.nonceGenerator,
 		profileBinding:       captchaProfileVersion + "\x00" + string(config.Provider) + "\x00" + config.SiteKey,
 		template:             tmpl,
 		spec:                 spec,
@@ -373,6 +390,14 @@ func (s *Service) writeChallenge(
 	if !ok {
 		return OutcomeFallback, ErrRenderChallenge
 	}
+	nonce, err := s.nonceGenerator()
+	if err != nil {
+		return OutcomeFallback, ErrRenderChallenge
+	}
+	csp, ok := contentSecurityPolicy(s.spec.csp, nonce)
+	if !ok {
+		return OutcomeFallback, ErrRenderChallenge
+	}
 
 	data := TemplateData{
 		Provider:    s.provider,
@@ -381,6 +406,7 @@ func (s *Service) writeChallenge(
 		WidgetClass: s.spec.widgetClass,
 		Action:      s.spec.expectedAction,
 		FormAction:  formAction,
+		Nonce:       nonce,
 		Failed:      failed,
 	}
 	body := boundedBuffer{maximum: maximumRenderedHTMLBytes}
@@ -392,7 +418,7 @@ func (s *Service) writeChallenge(
 	if err != nil {
 		return OutcomeFallback, ErrRenderChallenge
 	}
-	setSecurityHeaders(w.Header(), s.spec.csp)
+	setSecurityHeaders(w.Header(), csp)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	http.SetCookie(w, cookie)
 	w.WriteHeader(http.StatusOK)
@@ -403,6 +429,33 @@ func (s *Service) writeChallenge(
 		return OutcomeChallenge, ErrWriteResponse
 	}
 	return OutcomeChallenge, nil
+}
+
+func contentSecurityPolicy(base, nonce string) (string, bool) {
+	if !validScriptNonce(nonce) {
+		return "", false
+	}
+
+	const directive = "script-src "
+	index := strings.Index(base, directive)
+	if index < 0 {
+		return "", false
+	}
+	index += len(directive)
+	return base[:index] + "'nonce-" + nonce + "' " + base[index:], true
+}
+
+func validScriptNonce(nonce string) bool {
+	if len(nonce) < 16 || len(nonce) > 128 {
+		return false
+	}
+	for _, character := range nonce {
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') &&
+			(character < '0' || character > '9') && character != '+' && character != '/' && character != '=' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) writePassedRedirect(

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -88,7 +89,20 @@ func (m Matcher) Match(cx *l4.Connection) (bool, error) {
 
 	if !isAllowed {
 		m.logger.Debug(fmt.Sprintf("connection from %s not allowed", clientIP.String()))
-		m.crowdsec.IncrementBlockedRequests(server, *decision.Origin, *decision.Type, clientIP.Is6())
+		origin := "unknown"
+		decisionType := "unknown"
+		if decision != nil && decision.Origin != nil {
+			origin = *decision.Origin
+		}
+		if decision != nil && decision.Type != nil {
+			decisionType = *decision.Type
+		}
+		remediation := decisionType
+		if strings.EqualFold(strings.TrimSpace(decisionType), "captcha") {
+			// Layer 4 cannot present an interactive browser challenge.
+			remediation = "ban"
+		}
+		m.crowdsec.IncrementBlockedRequests(server, origin, remediation, clientIP.Is6())
 		return false, nil
 	}
 

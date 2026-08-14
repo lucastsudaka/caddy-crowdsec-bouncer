@@ -174,13 +174,31 @@ localhost:6443 {
 
 CAPTCHA support is opt-in. Configure all four required CAPTCHA options to turn a CrowdSec `captcha` decision into an interactive browser challenge. When all CAPTCHA options are omitted, the existing fail-closed behavior is preserved: `captcha` decisions are applied as HTTP 403 bans. A partial configuration prevents Caddy from starting.
 
-The bouncer renders a challenge with status 200 and verifies the provider token server-side. A successful proof creates a signed, host-only, `HttpOnly`, `SameSite=Strict` cookie bound to the client IP and redirects to the exact original relative URI with status 303. Challenges are only rendered for `GET` and `HEAD`; other methods fail closed until the client clears the CAPTCHA through a browser navigation. Request bodies are never replayed or sent upstream. A `ban` decision always takes precedence over a solved CAPTCHA. When both HTTP handlers are used in one route, keep `crowdsec` before `appsec`, as shown above, so stored decisions are evaluated before an AppSec challenge response.
+The equivalent global app fields can also be supplied in Caddy's native JSON configuration:
 
-Keep `captcha_secret_key` and `captcha_signing_key` in environment variables or a secrets manager. The signing key must be different from the provider secret and contain at least 32 bytes; for example, generate one with `openssl rand -base64 32`. Use HTTPS in production. All Caddy instances serving the same hosts must use the same provider, site key, and signing key so that a proof remains valid across replicas. Configure trusted proxies correctly: the resolved client IP is both sent to the provider and included in the signed proof binding.
+```json
+{
+  "apps": {
+    "crowdsec": {
+      "api_key": "{env.CROWDSEC_API_KEY}",
+      "captcha_provider": "turnstile",
+      "captcha_site_key": "{env.CROWDSEC_CAPTCHA_SITE_KEY}",
+      "captcha_secret_key": "{env.CROWDSEC_CAPTCHA_SECRET_KEY}",
+      "captcha_signing_key": "{env.CROWDSEC_CAPTCHA_SIGNING_KEY}"
+    }
+  }
+}
+```
 
-Provider timeouts, malformed responses, invalid internal submissions, and rendering failures all fail closed as bans. The challenge itself is written directly and does not use `handle_errors`; a ban fallback still respects `enable_caddy_error`. Layer 4 matchers cannot present browser challenges, so they always apply CAPTCHA decisions as connection bans.
+The bouncer renders a challenge with status 200 and verifies the provider token server-side. The default template submits each proof automatically after the provider reports success, including a new proof after a rejected attempt. A persistent server-side rejection, such as a hostname or action mismatch, can therefore cause repeated verification attempts; use the manual template if that behavior is unsuitable. A successful proof creates a signed, host-only, `HttpOnly`, `SameSite=Strict` cookie bound to the client IP and redirects to the exact original relative URI with status 303. Challenges are only rendered for `GET` and `HEAD`; other methods fail closed until the client clears the CAPTCHA through a browser navigation. Request bodies are never replayed or sent upstream. A `ban` decision always takes precedence over a solved CAPTCHA. When both HTTP handlers are used in one route, keep `crowdsec` before `appsec`, as shown above, so stored decisions are evaluated before an AppSec challenge response.
 
-A custom template uses Go's `html/template` syntax and receives `.Provider`, `.SiteKey`, `.ScriptURL`, `.WidgetClass`, `.Action`, `.FormAction`, and `.Failed`. Preserve `.FormAction` and the provider widget fields so submissions remain internal to the bouncer.
+Keep `captcha_secret_key` and `captcha_signing_key` in environment variables or a secrets manager. The signing key must be different from the provider secret and contain at least 32 bytes; for example, generate one with `openssl rand -base64 32`. Restrict the provider site key to every hostname served by this Caddy configuration using [reCAPTCHA domain validation](https://developers.google.com/recaptcha/docs/domain_validation), the [hCaptcha domain allowlist](https://docs.hcaptcha.com/configuration/#domain-allowlist), or [Turnstile hostname management](https://developers.cloudflare.com/turnstile/additional-configuration/hostname-management/). In particular, hCaptcha site keys work on any domain until Domain Allowlisting is enabled in the hCaptcha dashboard. Use separate provider credentials for development and production.
+
+Use HTTPS in production. All Caddy instances serving the same hosts must use the same provider, site key, secret key, signing key, and CAPTCHA expiration so that challenges and proofs remain valid across replicas. Configure Caddy's [trusted proxies](https://caddyserver.com/docs/caddyfile/options#trusted-proxies) correctly: the client IP resolved by Caddy is both sent to the provider and included in the signed proof binding. The cookie remains browser-local, so clients behind the same NAT do not share clearance; however, an IP change or inconsistent proxy resolution between replicas invalidates an existing clearance.
+
+Provider timeouts, malformed responses, invalid internal submissions, and rendering failures all fail closed as bans. The challenge itself is written directly and does not use `handle_errors`; a ban fallback still respects `enable_caddy_error`. Metrics record a rendered challenge as remediation `captcha`, while fail-closed fallbacks and Layer 4 enforcement are recorded as `ban`. Solved proofs and valid clearance cookies are not counted as blocked requests. Layer 4 matchers cannot present browser challenges, so they always apply CAPTCHA decisions as connection bans.
+
+A custom template uses Go's `html/template` syntax and receives `.Provider`, `.SiteKey`, `.ScriptURL`, `.WidgetClass`, `.Action`, `.FormAction`, `.Nonce`, and `.Failed`. Preserve `.FormAction` and the provider widget fields so submissions remain internal to the bouncer. Trusted inline scripts must use `nonce="{{.Nonce}}"`; other inline scripts are blocked by the response Content Security Policy. A manual-submit example is available in [`examples/captcha-templates`](examples/captcha-templates/README.md).
 
 Run the Caddy server
 
