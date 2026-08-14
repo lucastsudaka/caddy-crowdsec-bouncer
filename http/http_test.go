@@ -215,6 +215,25 @@ func TestHandlerCaptchaWithoutConfigurationFallsBackToBan(t *testing.T) {
 	assert.Equal(t, nethttp.StatusForbidden, w.Code)
 }
 
+func TestHandlerCaptchaAcceptsOptionalMetadata(t *testing.T) {
+	lapi := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, _ *nethttp.Request) {
+		_, _ = fmt.Fprintf(w, `[{"id":1,"scope":"Ip","type":"captcha","value":%q}]`, testClientIP)
+	}))
+	defer lapi.Close()
+
+	cs, _ := newHandlerTestCrowdSec(t, lapi.URL, true)
+	handler := &Handler{crowdsec: cs, logger: zaptest.NewLogger(t)}
+	w := httptest.NewRecorder()
+	r := requestWithClientIP(httptest.NewRequest(nethttp.MethodGet, "http://example.com/protected", nil))
+
+	require.NoError(t, handler.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(nethttp.ResponseWriter, *nethttp.Request) error {
+		t.Fatal("a CAPTCHA challenge must not call the next handler")
+		return nil
+	})))
+	assert.Equal(t, nethttp.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "cf-turnstile")
+}
+
 func TestHandlerPreservesLegacyNonCaptchaActionMatching(t *testing.T) {
 	lapi := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, _ *nethttp.Request) {
 		_, _ = fmt.Fprintf(w, `[{"duration":"1h","id":1,"origin":"cscli","scenario":"test","scope":"Ip","type":"THROTTLE","value":%q}]`, testClientIP)
