@@ -124,3 +124,39 @@ func TestWriteResponse_Throttle(t *testing.T) {
 		assert.Equal(t, "10", w.Header().Get("Retry-After"))
 	})
 }
+
+func TestWriteResponse_CaptchaFallback(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	t.Run("writes fail-closed ban", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		err := WriteResponse(w, logger, "captcha", "192.168.1.1", "", 0, false)
+
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+		assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
+	})
+
+	t.Run("preserves Caddy error behavior", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		err := WriteResponse(w, logger, "captcha", "192.168.1.1", "", 0, true)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrBanned)
+	})
+}
+
+func TestFallbackRemediation(t *testing.T) {
+	tests := map[string]string{
+		"ban":       "ban",
+		"captcha":   "ban",
+		"throttle":  "throttle",
+		"something": "ban",
+	}
+
+	for typ, expected := range tests {
+		t.Run(typ, func(t *testing.T) {
+			assert.Equal(t, expected, FallbackRemediation(typ))
+		})
+	}
+}

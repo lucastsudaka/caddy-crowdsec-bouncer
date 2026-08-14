@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -95,6 +96,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	ctx, ip = httputils.EnsureIP(ctx)
 	ctx = h.crowdsec.IncrementProcessedRequests(ctx, server, module, ip.Is6())
+	r = r.WithContext(ctx)
 
 	isAllowed, decision, err := h.crowdsec.IsAllowed(ctx, ip)
 	if err != nil {
@@ -104,29 +106,81 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// TODO: if the IP is allowed, should we (temporarily) put it in an explicit allowlist for quicker check?
 
 	if !isAllowed {
-		// TODO: maybe some configuration to override the type of action with a ban, some default, something like that?
-		// TODO: can we provide the reason for the response to the Caddy logger, like the CrowdSec type, duration, etc.
-		typ := *decision.Type
-		value := *decision.Value
-		duration := *decision.Duration
-		origin := *decision.Origin
+		typ := "ban"
+		value := ip.String()
+		duration := ""
+		origin := "unknown"
+		if decision != nil {
+			if decision.Type != nil {
+				typ = *decision.Type
+			}
+			if decision.Value != nil {
+				value = *decision.Value
+			}
+			if decision.Duration != nil {
+				duration = *decision.Duration
+			}
+			if decision.Origin != nil {
+				origin = *decision.Origin
+			}
+		}
+		typ = strings.ToLower(strings.TrimSpace(typ))
 
-		if err := httputils.WriteResponse(w, h.logger, typ, value, duration, 0, h.crowdsec.EnableCaddyError); err != nil {
-			h.crowdsec.IncrementBlockedRequests(server, origin, typ, ip.Is6()) // TODO: properly set the action that was performed
+		if typ == "captcha" {
+			handled, err := h.handleCaptcha(w, r, ip, server, origin)
+			if err != nil || handled {
+				return err
+			}
+		} else {
+			remediation := httputils.FallbackRemediation(typ)
+			if err := httputils.WriteResponse(w, h.logger, typ, value, duration, 0, h.crowdsec.EnableCaddyError); err != nil {
+				h.crowdsec.IncrementBlockedRequests(server, origin, remediation, ip.Is6())
+				return err
+			}
+
+			h.crowdsec.IncrementBlockedRequests(server, origin, remediation, ip.Is6())
+			return nil
+		}
+	}
+
+	// A marked submission must never reach an upstream, even if the decision
+	// expired between rendering and submitting the challenge.
+	if h.crowdsec.IsCaptchaSubmission(r) {
+		handled, err := h.handleCaptcha(w, r, ip, server, "crowdsec")
+		if err != nil || handled {
 			return err
 		}
-
-		h.crowdsec.IncrementBlockedRequests(server, origin, typ, ip.Is6()) // TODO: properly set the action that was performed
-
-		return nil
 	}
 
 	// Continue down the handler stack
-	if err := next.ServeHTTP(w, r.WithContext(ctx)); err != nil {
+	if err := next.ServeHTTP(w, r); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (h *Handler) handleCaptcha(w http.ResponseWriter, r *http.Request, ip netip.Addr, server, origin string) (bool, error) {
+	outcome, err := h.crowdsec.HandleCaptcha(w, r, ip)
+	switch outcome {
+	case crowdsec.CaptchaOutcomeChallenge:
+		h.crowdsec.IncrementBlockedRequests(server, origin, "captcha", ip.Is6())
+		return true, err
+	case crowdsec.CaptchaOutcomeSolved:
+		return true, err
+	case crowdsec.CaptchaOutcomeBypass:
+		return false, err
+	case crowdsec.CaptchaOutcomeUnavailable, crowdsec.CaptchaOutcomeFallback:
+		if err != nil {
+			h.logger.Debug("CAPTCHA verification failed; applying ban fallback", zap.Error(err))
+		}
+	default:
+		h.logger.Warn("CAPTCHA returned an unknown outcome; applying ban fallback", zap.String("outcome", outcome.String()))
+	}
+
+	writeErr := httputils.WriteResponse(w, h.logger, "captcha", ip.String(), "", 0, h.crowdsec.EnableCaddyError)
+	h.crowdsec.IncrementBlockedRequests(server, origin, "ban", ip.Is6())
+	return true, writeErr
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.

@@ -91,20 +91,27 @@ Configuration using a Caddyfile is supported for HTTP handlers and Layer 4 match
 
 #### Configuration Options
 
-| Directive               | Description                                                                                                                                                         | Default                  |
-|:------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------------------------|
-| `api_url`               | The URL of the CrowdSec Local API.                                                                                                                                  | `http://127.0.0.1:8080/` |
-| `api_key`               | The API key to authenticate with the Local API.                                                                                                                     | `<empty>` *(required)*   |
-| `disable_streaming`     | Falls back to LiveBouncer mode (queries API per request).                                                                                                           | `false`                  |
-| `metrics_interval`      | Interval for pushing metrics to the Local API.                                                                                                                      | `0s` *(disabled)*        |
-| `enable_caddy_metrics`  | Enables emitting bouncer metrics at Caddy's `/metrics` endpoint.                                                                                                    | `false`                  |
-| `ticker_interval`       | Interval for pulling decisions from the Local API.                                                                                                                  | `60s`                    |
-| `enable_hard_fails`     | Caddy fails to start if CrowdSec API is unreachable.                                                                                                                | `false`                  |
-| `appsec_url`            | The URL of the CrowdSec AppSec component.                                                                                                                           | `<empty>` *(disabled)*   |
-| `appsec_max_body_bytes` | Maximum request body size sent to AppSec.                                                                                                                           | `0` *(full request)*     |
-| `appsec_max_timeout`.   | Maximum time for request to AppSec component.                                                                                                                       | `2s`                     |
-| `appsec_fail_open`      | Ignore AppSec component connection errors.                                                                                                                          | `false`                  |
-| `enable_caddy_error`    | Propagates decisions as Caddy errors to allow custom error pages. **Warning:** Ensure `handle_errors` routes are strictly static to avoid resource exhaustion (DoS).| `false`                  |
+| Directive                 | Description                                                                                                                                                          | Default                  |
+|:--------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------------------------|
+| `api_url`                 | The URL of the CrowdSec Local API.                                                                                                                                   | `http://127.0.0.1:8080/` |
+| `api_key`                 | The API key to authenticate with the Local API.                                                                                                                      | `<empty>` *(required)*   |
+| `disable_streaming`       | Falls back to LiveBouncer mode (queries API per request).                                                                                                            | `false`                  |
+| `metrics_interval`        | Interval for pushing metrics to the Local API.                                                                                                                       | `0s` *(disabled)*        |
+| `enable_caddy_metrics`    | Enables emitting bouncer metrics at Caddy's `/metrics` endpoint.                                                                                                     | `false`                  |
+| `ticker_interval`         | Interval for pulling decisions from the Local API.                                                                                                                   | `60s`                    |
+| `enable_hard_fails`       | Caddy fails to start if CrowdSec API is unreachable.                                                                                                                 | `false`                  |
+| `captcha_provider`        | CAPTCHA provider: `recaptcha`, `hcaptcha`, or `turnstile`. Setting any CAPTCHA option requires a complete CAPTCHA configuration.                                     | `<empty>` *(disabled)*   |
+| `captcha_site_key`        | Public site key issued by the CAPTCHA provider.                                                                                                                      | `<empty>` *(required)*   |
+| `captcha_secret_key`      | Secret verification key issued by the CAPTCHA provider.                                                                                                             | `<empty>` *(required)*   |
+| `captcha_signing_key`     | Independent secret used to sign CAPTCHA state cookies; must contain at least 32 bytes.                                                                                | `<empty>` *(required)*   |
+| `captcha_template_path`   | Optional path to a custom HTML challenge template.                                                                                                                   | `<empty>`                |
+| `captcha_expiration`      | How long a successful CAPTCHA remains valid (maximum `24h`).                                                                                                         | `1h`                     |
+| `captcha_timeout`         | Maximum time for server-side verification with the CAPTCHA provider (maximum `1m`).                                                                                 | `5s`                     |
+| `appsec_url`              | The URL of the CrowdSec AppSec component.                                                                                                                            | `<empty>` *(disabled)*   |
+| `appsec_max_body_bytes`   | Maximum request body size sent to AppSec.                                                                                                                            | `0` *(full request)*     |
+| `appsec_timeout`          | Maximum time for request to AppSec component.                                                                                                                        | `2s`                     |
+| `appsec_fail_open`        | Ignore AppSec component connection errors.                                                                                                                           | `false`                  |
+| `enable_caddy_error`      | Propagates decisions as Caddy errors to allow custom error pages. **Warning:** Ensure `handle_errors` routes are strictly static to avoid resource exhaustion (DoS). | `false`                  |
 
 #### Example
 
@@ -117,6 +124,12 @@ Configuration using a Caddyfile is supported for HTTP handlers and Layer 4 match
     api_key <api_key>
     ticker_interval 15s
     appsec_url http://localhost:7422
+    #captcha_provider turnstile
+    #captcha_site_key {$CROWDSEC_CAPTCHA_SITE_KEY}
+    #captcha_secret_key {$CROWDSEC_CAPTCHA_SECRET_KEY}
+    #captcha_signing_key {$CROWDSEC_CAPTCHA_SIGNING_KEY}
+    #captcha_expiration 1h
+    #captcha_timeout 5s
     #disable_streaming
     #enable_hard_fails
     #enable_caddy_error
@@ -156,6 +169,18 @@ localhost:6443 {
   }
 }
 ```
+
+#### CAPTCHA Remediation
+
+CAPTCHA support is opt-in. Configure all four required CAPTCHA options to turn a CrowdSec `captcha` decision into an interactive browser challenge. When all CAPTCHA options are omitted, the existing fail-closed behavior is preserved: `captcha` decisions are applied as HTTP 403 bans. A partial configuration prevents Caddy from starting.
+
+The bouncer renders a challenge with status 200 and verifies the provider token server-side. A successful proof creates a signed, host-only, `HttpOnly`, `SameSite=Strict` cookie bound to the client IP and redirects to the exact original relative URI with status 303. Challenges are only rendered for `GET` and `HEAD`; other methods fail closed until the client clears the CAPTCHA through a browser navigation. Request bodies are never replayed or sent upstream. A `ban` decision always takes precedence over a solved CAPTCHA. When both HTTP handlers are used in one route, keep `crowdsec` before `appsec`, as shown above, so stored decisions are evaluated before an AppSec challenge response.
+
+Keep `captcha_secret_key` and `captcha_signing_key` in environment variables or a secrets manager. The signing key must be different from the provider secret and contain at least 32 bytes; for example, generate one with `openssl rand -base64 32`. Use HTTPS in production. All Caddy instances serving the same hosts must use the same provider, site key, and signing key so that a proof remains valid across replicas. Configure trusted proxies correctly: the resolved client IP is both sent to the provider and included in the signed proof binding.
+
+Provider timeouts, malformed responses, invalid internal submissions, and rendering failures all fail closed as bans. The challenge itself is written directly and does not use `handle_errors`; a ban fallback still respects `enable_caddy_error`. Layer 4 matchers cannot present browser challenges, so they always apply CAPTCHA decisions as connection bans.
+
+A custom template uses Go's `html/template` syntax and receives `.Provider`, `.SiteKey`, `.ScriptURL`, `.WidgetClass`, `.Action`, `.FormAction`, and `.Failed`. Preserve `.FormAction` and the provider widget fields so submissions remain internal to the bouncer.
 
 Run the Caddy server
 
@@ -242,7 +267,6 @@ You can override the default header using the [`client_ip_headers`](https://cadd
 - [ ] Add integration tests for the HTTP and L4 handlers
 - [ ] Implement tests for IPv6 support
 - [ ] Validate *project conncept* (Caddy layer 4 app: TCP working, UDP needs testing)
-- [ ] Add support for captcha actions
 - [ ] Implement support for custom actions (currently defaults to block)
 - [ ] Integrate with Caddy metrics
 - [ ] Integrate with Caddy profiling

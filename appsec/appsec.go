@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -98,26 +99,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	ctx = h.crowdsec.IncrementProcessedRequests(ctx, server, module, ip.Is6())
 
 	r = r.WithContext(ctx)
+
+	// CAPTCHA submissions are internal control requests. Validate them before
+	// AppSec so provider tokens and signed state cookies are never forwarded to
+	// the AppSec endpoint. The resulting redirect is checked normally again.
+	if h.crowdsec.IsCaptchaSubmission(r) {
+		handled, err := h.handleCaptcha(w, r, ip, server, module, 0)
+		if err != nil || handled {
+			return err
+		}
+	}
+
 	if err := h.crowdsec.CheckRequest(ctx, r); err != nil {
 		a := &core.AppSecError{}
 		if !errors.As(err, &a) {
 			return err
 		}
 
-		switch a.Action {
+		action := strings.ToLower(strings.TrimSpace(a.Action))
+		switch action {
 		case "allow":
 			// nothing to do
-			h.crowdsec.IncrementBlockedRequests(server, module, "bypass", ip.Is6()) // TODO: properly set the action that was performed
 		case "log":
 			h.logger.Info("appsec rule triggered", zap.String("ip", ip.String()), zap.String("action", a.Action))
-			h.crowdsec.IncrementBlockedRequests(server, module, "log", ip.Is6()) // TODO: properly set the action that was performed
+		case "captcha":
+			handled, err := h.handleCaptcha(w, r, ip, server, module, a.StatusCode)
+			if err != nil || handled {
+				return err
+			}
 		default:
-			if err := httputils.WriteResponse(w, h.logger, a.Action, ip.String(), a.Duration, a.StatusCode, h.crowdsec.EnableCaddyError); err != nil {
-				h.crowdsec.IncrementBlockedRequests(server, module, a.Action, ip.Is6()) // TODO: properly set the action that was performed
+			remediation := httputils.FallbackRemediation(action)
+			if err := httputils.WriteResponse(w, h.logger, action, ip.String(), a.Duration, a.StatusCode, h.crowdsec.EnableCaddyError); err != nil {
+				h.crowdsec.IncrementBlockedRequests(server, module, remediation, ip.Is6())
 				return err
 			}
 
-			h.crowdsec.IncrementBlockedRequests(server, module, a.Action, ip.Is6()) // TODO: properly set the action that was performed
+			h.crowdsec.IncrementBlockedRequests(server, module, remediation, ip.Is6())
 			return nil
 		}
 	}
@@ -128,6 +145,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	return nil
+}
+
+func (h *Handler) handleCaptcha(
+	w http.ResponseWriter,
+	r *http.Request,
+	ip netip.Addr,
+	server string,
+	origin string,
+	statusCode int,
+) (bool, error) {
+	outcome, err := h.crowdsec.HandleCaptcha(w, r, ip)
+	switch outcome {
+	case crowdsec.CaptchaOutcomeChallenge:
+		h.crowdsec.IncrementBlockedRequests(server, origin, "captcha", ip.Is6())
+		return true, err
+	case crowdsec.CaptchaOutcomeSolved:
+		return true, err
+	case crowdsec.CaptchaOutcomeBypass:
+		return false, err
+	case crowdsec.CaptchaOutcomeUnavailable, crowdsec.CaptchaOutcomeFallback:
+		if err != nil {
+			h.logger.Debug("CAPTCHA verification failed; applying ban fallback", zap.Error(err))
+		}
+	default:
+		h.logger.Warn("CAPTCHA returned an unknown outcome; applying ban fallback", zap.String("outcome", outcome.String()))
+	}
+
+	writeErr := httputils.WriteResponse(w, h.logger, "captcha", ip.String(), "", statusCode, h.crowdsec.EnableCaddyError)
+	h.crowdsec.IncrementBlockedRequests(server, origin, "ban", ip.Is6())
+	return true, writeErr
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.

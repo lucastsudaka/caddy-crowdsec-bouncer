@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -63,6 +64,7 @@ func determineIPFromRequest(ctx context.Context) (netip.Addr, error) {
 // WriteResponse writes a response to the [http.ResponseWriter] based on the typ, value,
 // duration and status code provide.
 func WriteResponse(w http.ResponseWriter, logger *zap.Logger, typ, value, duration string, statusCode int, useCaddyError bool) error {
+	typ = strings.ToLower(strings.TrimSpace(typ))
 	switch typ {
 	case "ban":
 		logger.Debug(fmt.Sprintf("serving ban response to %s", value))
@@ -80,6 +82,18 @@ func WriteResponse(w http.ResponseWriter, logger *zap.Logger, typ, value, durati
 	}
 }
 
+// FallbackRemediation returns the remediation actually performed by
+// WriteResponse. CAPTCHA challenges are handled by the HTTP modules before
+// reaching WriteResponse; its captcha case deliberately remains a fail-closed
+// ban for unconfigured and non-HTTP callers.
+func FallbackRemediation(typ string) string {
+	if strings.EqualFold(strings.TrimSpace(typ), "throttle") {
+		return "throttle"
+	}
+
+	return "ban"
+}
+
 // writeBanResponse writes a 403 status as response
 func writeBanResponse(w http.ResponseWriter, statusCode int, useCaddyError bool) error {
 	code := statusCode
@@ -94,9 +108,9 @@ func writeBanResponse(w http.ResponseWriter, statusCode int, useCaddyError bool)
 	return nil
 }
 
-// writeCaptchaResponse (currently) writes a 403 status as response
+// writeCaptchaResponse preserves the historical fail-closed behavior when a
+// CAPTCHA decision reaches a caller that cannot serve a browser challenge.
 func writeCaptchaResponse(w http.ResponseWriter, statusCode int, useCaddyError bool) error {
-	// TODO: implement showing a captcha in some way. How? hCaptcha? And how to handle afterwards?
 	return writeBanResponse(w, statusCode, useCaddyError)
 }
 
