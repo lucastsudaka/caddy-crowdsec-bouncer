@@ -134,6 +134,20 @@ func TestWriteResponse_Throttle(t *testing.T) {
 	})
 }
 
+func TestWriteResponse_UnknownTypeFailsClosed(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	for _, typ := range []string{"custom-remediation", "THROTTLE", " throttle "} {
+		t.Run(typ, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			err := WriteResponse(w, logger, typ, "192.168.1.1", "10s", 0, false)
+
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusForbidden, w.Code)
+			assert.Empty(t, w.Header().Get("Retry-After"))
+		})
+	}
+}
 func TestSetBlockVars(t *testing.T) {
 	assert.Equal(t, "crowdsec.module", ModuleVarKey)
 	assert.Equal(t, "crowdsec.remediation", RemediationVarKey)
