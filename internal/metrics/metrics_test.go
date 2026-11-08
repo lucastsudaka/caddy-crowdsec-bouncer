@@ -96,8 +96,16 @@ func TestDecisionCountsRemoveOnlyInactiveSeries(t *testing.T) {
 func TestDecisionCountsStayVisibleDuringConcurrentCollection(t *testing.T) {
 	usageRegistry := prometheus.NewRegistry()
 	caddyRegistry := prometheus.NewRegistry()
-	provider, err := NewProvider(nil, usageRegistry, caddyRegistry, time.Minute,
-		zap.NewNop(), "testing", "v0.0.0", "test")
+	provider, err := NewProvider(Config{
+		MetricsRegistry:      usageRegistry,
+		CaddyMetricsRegistry: caddyRegistry,
+		Interval:             time.Minute,
+		Timeout:              10 * time.Second,
+		Logger:               zap.NewNop(),
+		UserAgentName:        "testing",
+		UserAgentVersion:     "v0.0.0",
+		InstanceID:           "test",
+	})
 	require.NoError(t, err)
 
 	const decisionCount = 100_000
